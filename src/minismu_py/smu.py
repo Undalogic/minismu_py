@@ -25,7 +25,7 @@ class SMU:
     """Interface for the SMU device supporting both USB and network connections"""
     
     def __init__(self, connection_type: ConnectionType, port: str = "/dev/ttyACM0", 
-                 host: str = "192.168.1.1", tcp_port: int = 5555):
+                 host: str = "192.168.1.1", tcp_port: int = 3333):
         """
         Initialize SMU connection
         
@@ -66,10 +66,20 @@ class SMU:
                 self._connection.write(f"{command}\n".encode())
                 response = self._connection.readline().decode().strip()
             else:
-                self._connection.send(f"{command}\n".encode())
+                self._connection.send(f"{command}".encode())
                 response = self._connection.recv(1024).decode().strip()
             
+            # Check if response is an acknowledgment
+            if response == "OK":
+                return response
+                
+            # For query commands (ending with ?), return the raw response
+            if command.endswith("?"):
+                return response
+                
+            # For other commands, return the response
             return response
+            
         except (serial.SerialException, socket.error) as e:
             raise SMUException(f"Communication error: {e}")
 
@@ -184,6 +194,24 @@ class SMU:
         """Stop data streaming for specified channel"""
         self._send_command(f"SOUR{channel}:DATA:STREAM OFF")
 
+    def read_streaming_data(self) -> Tuple[int, float, float, float]:
+        """
+        Read a single data packet from the streaming buffer
+        
+        Returns:
+            Tuple of (channel, timestamp, voltage, current) from the streaming data
+        """
+        if self.connection_type == ConnectionType.USB:
+            # Read the data packet
+            data = self._connection.readline().decode().strip()
+            try:
+                channel, timestamp, voltage, current = data.split(',')
+                return int(channel), float(timestamp), float(voltage), float(current)
+            except ValueError as e:
+                raise SMUException(f"Failed to parse streaming data: {data}")
+        else:
+            raise SMUException("Streaming is only supported over USB connection")
+
     def set_sample_rate(self, channel: int, rate: float):
         """
         Set sample rate for specified channel
@@ -220,6 +248,15 @@ class SMU:
         """
         response = self._send_command("SYST:TEMP?")
         return tuple(map(float, response.split(',')))
+
+    def set_time(self, timestamp: int):
+        """
+        Set the device's internal clock using a Unix timestamp in milliseconds
+        
+        Args:
+            timestamp: Unix timestamp in milliseconds
+        """
+        self._send_command(f"SYST:TIME {timestamp}")
 
     # WiFi Configuration Methods
     def wifi_scan(self) -> list:

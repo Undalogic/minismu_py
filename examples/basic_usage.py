@@ -3,7 +3,7 @@ import time
 
 def main():
     # Create SMU instance with USB connection
-    with SMU(ConnectionType.USB, port="COM8") as smu:
+    with SMU(ConnectionType.USB, port="COM50") as smu:
         # Print device information
         print("Device Info:", smu.get_identity())
         
@@ -12,14 +12,19 @@ def main():
         smu.set_voltage_range(1, "AUTO")
         smu.enable_channel(1)
         
-        # Set voltage and measure
-        smu.set_voltage(1, 0.5)
+        # Set voltage on channel 1 to 0.5V
+        smu_channel = 1
+        set_voltage = 0.5
+        smu.set_voltage(smu_channel, set_voltage)
         time.sleep(0.1)  # Allow settling time
         
         # Take measurements
         voltage, current = smu.measure_voltage_and_current(1)
         print(f"Voltage: {voltage:.6f}V")
         print(f"Current: {current:.6f}A")
+
+        # Disable channel 1
+        smu.disable_channel(1)
         
         # Temperature monitoring
         adc_temp, ch1_temp, ch2_temp = smu.get_temperatures()
