@@ -1,6 +1,6 @@
-# SMU Interface
+# miniSMU Python Interface
 
-Python interface library for Undalogic SMU devices. Supports both USB and network connections for controlling and measuring with SMU devices.
+Python interface library for Undalogic miniSMU devices. Supports both USB and network connections for controlling and measuring with miniSMU devices.
 
 ## Installation
 
