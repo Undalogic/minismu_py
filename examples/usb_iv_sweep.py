@@ -56,7 +56,7 @@ def voltage_sweep_example(smu: SMU, channel: int = 1):
 
 def main():
     # Connection parameters
-    miniSMU_PORT = "COM50"  # Replace with your miniSMU's USB port
+    miniSMU_PORT = "COM41"  # Replace with your miniSMU's USB port
     
     try:
         # Create USB manager and connect to SMU
