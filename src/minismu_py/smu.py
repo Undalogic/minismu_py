@@ -498,11 +498,57 @@ class SMU:
     def set_time(self, timestamp: int):
         """
         Set the device's internal clock using a Unix timestamp in milliseconds
-        
+
         Args:
             timestamp: Unix timestamp in milliseconds
         """
         self._send_command(f"SYST:TIME {timestamp}")
+
+    # 4-Wire (Kelvin) Measurement Mode Methods
+    def enable_fourwire_mode(self):
+        """
+        Enable 4-wire (Kelvin) measurement mode
+
+        In 4-wire mode:
+        - CH1 acts as the source/force channel (FVMI mode)
+        - CH2 acts as the sense channel (FIMV mode @ 0A, high impedance)
+        - Measurements on CH1 return CH1 current + CH2 voltage (true DUT voltage)
+        - This eliminates lead resistance errors in high-current applications
+
+        Note:
+        - Cannot enable while streaming or sweep is active
+        - CH2 commands are blocked while 4-wire mode is active
+        - OUTP1 ON/OFF controls both channels together
+
+        Raises:
+            SMUException: If 4-wire mode cannot be enabled (streaming/sweep active)
+        """
+        response = self._send_command("SYST:4WIR ENA")
+        if response.startswith("ERROR"):
+            raise SMUException(response)
+
+    def disable_fourwire_mode(self):
+        """
+        Disable 4-wire measurement mode and restore independent channel operation
+
+        After disabling:
+        - CH2 returns to its previous state
+        - Both channels can be controlled independently
+        - Measurements return values from the measured channel only
+        """
+        response = self._send_command("SYST:4WIR DIS")
+        if response.startswith("ERROR"):
+            raise SMUException(response)
+
+    def get_fourwire_mode(self) -> bool:
+        """
+        Query 4-wire measurement mode status
+
+        Returns:
+            True if 4-wire mode is enabled, False otherwise
+        """
+        response = self._send_command("SYST:4WIR?")
+        return response.strip() == "1"
 
     # WiFi Configuration Methods
     def wifi_scan(self) -> list:
