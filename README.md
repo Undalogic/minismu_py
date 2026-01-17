@@ -9,6 +9,7 @@ A comprehensive Python library for controlling the miniSMU MS01 Source Measure U
 - **Advanced Measurement Features**: Configurable oversampling ratio (OSR) for precision control
 - **Safety Protection**: Current and voltage protection limits
 - **Onboard I-V Sweeps**: Hardware-accelerated sweeps with progress monitoring (firmware v1.3.4+)
+- **4-Wire (Kelvin) Measurements**: High-accuracy measurements eliminating lead resistance errors (firmware v1.4.3+)
 - **WiFi Management**: Network configuration, scanning, and auto-connect settings
 - **Data Streaming**: Real-time continuous measurements
 - **Robust Communication**: Handles chunked USB data and corruption gracefully
@@ -191,6 +192,44 @@ for point in data_points:
     print(f"{point.voltage:.3f}V, {point.current*1e6:.1f}µA")
 ```
 
+### 4-Wire (Kelvin) Measurements (Firmware v1.4.3+)
+
+4-wire sensing eliminates lead resistance errors for high-accuracy measurements by using separate force and sense connections.
+
+#### How It Works
+- **CH1** acts as the source/force channel
+- **CH2** acts as the sense channel (high-impedance voltage measurement)
+- Measurements on CH1 return CH1 current with CH2 voltage (true DUT voltage)
+- `OUTP1 ON/OFF` controls both channels together in 4-wire mode
+
+#### Basic Usage
+```python
+# Enable 4-wire mode
+smu.enable_fourwire_mode()
+
+# Verify mode is active
+if smu.get_fourwire_mode():
+    print("4-wire mode enabled")
+
+# Configure and enable output (controls both channels)
+smu.set_mode(1, "FVMI")
+smu.set_voltage(1, 1.0)
+smu.enable_channel(1)
+
+# Measure - voltage comes from CH2 sense, current from CH1
+voltage, current = smu.measure_voltage_and_current(1)
+print(f"True DUT voltage: {voltage:.6f}V, Current: {current*1000:.3f}mA")
+
+# Disable when done
+smu.disable_channel(1)
+smu.disable_fourwire_mode()
+```
+
+#### Important Notes
+- Cannot enable 4-wire mode while streaming or sweep is active
+- CH2 commands are blocked while 4-wire mode is active
+- Use `disable_fourwire_mode()` to restore independent channel operation
+
 ### WiFi Management
 
 #### Network Configuration
@@ -246,6 +285,7 @@ The `examples/` directory contains comprehensive examples demonstrating various 
 - **`usb_iv_sweep.py`** - Manual I-V sweep over USB with progress bars
 - **`wifi_iv_sweep.py`** - Manual I-V sweep over WiFi
 - **`onboard_iv_sweep.py`** - Hardware-accelerated onboard I-V sweeps
+- **`fourwire_iv_sweep.py`** - 4-wire (Kelvin) I-V sweep for high-accuracy measurements
   - Simple sweep with progress monitoring
   - Advanced configuration examples
   - Data format comparison (CSV vs JSON)
@@ -331,8 +371,10 @@ except Exception as e:
 - **Permissions**: On Linux, you may need to add your user to the `dialout` group
 
 #### Firmware Compatibility
+- **4-Wire Mode**: Requires firmware v1.4.3 or later
 - **Onboard I-V Sweeps**: Requires firmware v1.3.4 or later
 - **Feature Support**: Older firmware may not support all features
+- **Firmware Updates**: Update your miniSMU firmware using the [online update tool](https://www.undalogic.com/minismu/firmware-update)
 
 #### Communication Issues
 The library automatically handles:
@@ -374,6 +416,11 @@ SMU(connection_type, port="/dev/ttyACM0", host="192.168.1.1", tcp_port=3333)
 - `get_sweep_data_json(channel)` - Get structured results
 - `abort_sweep(channel)` - Stop running sweep
 
+### 4-Wire Measurement Methods
+- `enable_fourwire_mode()` - Enable 4-wire mode (CH2 becomes sense channel)
+- `disable_fourwire_mode()` - Disable 4-wire mode and restore independent channels
+- `get_fourwire_mode()` - Query current 4-wire mode status
+
 ### WiFi Methods
 - `wifi_scan()` - Scan for networks
 - `set_wifi_credentials(ssid, password)` - Configure network
@@ -403,6 +450,10 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - **Website**: [www.undalogic.com](http://www.undalogic.com)
 
 ## Changelog
+
+### v0.3.0
+- Added 4-wire (Kelvin) measurement mode for high-accuracy measurements (firmware v1.4.3+)
+- New example `fourwire_iv_sweep.py` demonstrating 4-wire measurement techniques
 
 ### v0.2.0
 - Added onboard I-V sweep functionality (firmware v1.3.4+)
