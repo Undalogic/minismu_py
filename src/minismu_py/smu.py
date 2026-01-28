@@ -3,7 +3,7 @@ import socket
 import time
 import json
 from enum import Enum
-from typing import Optional, Tuple, Dict, Union, List
+from typing import Tuple, Union, List
 from dataclasses import dataclass
 
 @dataclass
@@ -48,6 +48,16 @@ class ConnectionType(Enum):
 class SMUException(Exception):
     """Custom exception for SMU-related errors"""
     pass
+
+# Current range limits in amperes (absolute value)
+# Range index -> max current magnitude
+CURRENT_RANGE_LIMITS = {
+    0: 1e-6,      # Range 0: ± 1 µA
+    1: 25e-6,     # Range 1: ± 25 µA
+    2: 650e-6,    # Range 2: ± 650 µA
+    3: 15e-3,     # Range 3: ± 15 mA
+    4: 180e-3,    # Range 4: ± 180 mA
+}
 
 class SMU:
     """Interface for the SMU device supporting both USB and network connections"""
@@ -410,7 +420,7 @@ class SMU:
     def set_voltage_range(self, channel: int, range_type: str):
         """
         Set voltage range for channel
-        
+
         Args:
             channel: Channel number (1 or 2)
             range_type: 'AUTO', 'LOW', or 'HIGH'
@@ -418,6 +428,122 @@ class SMU:
         if range_type not in ['AUTO', 'LOW', 'HIGH']:
             raise ValueError("Range type must be 'AUTO', 'LOW', or 'HIGH'")
         self._send_command(f"SOUR{channel}:VOLT:RANGE {range_type}")
+
+    # Current Range Methods
+    def set_autorange(self, channel: int, enabled: bool):
+        """
+        Enable or disable automatic current range switching
+
+        By default, the miniSMU automatically switches current range to the most
+        appropriate range for the measured current. Disabling autorange allows
+        manual control of the current range using set_current_range().
+
+        Args:
+            channel: Channel number (1 or 2)
+            enabled: True to enable autoranging, False to disable
+        """
+        if enabled:
+            self._send_command(f"CH{channel}:AUTORANGE:ENA")
+        else:
+            self._send_command(f"CH{channel}:AUTORANGE:DIS")
+
+    def set_current_range(self, channel: int, range_index: int):
+        """
+        Manually set the current measurement range
+
+        Note: Autoranging must be disabled first using set_autorange(channel, False)
+        for this setting to take effect.
+
+        Available ranges:
+            0: ± 1 µA
+            1: ± 25 µA
+            2: ± 650 µA
+            3: ± 15 mA
+            4: ± 180 mA
+
+        Args:
+            channel: Channel number (1 or 2)
+            range_index: Range index (0-4)
+
+        Raises:
+            ValueError: If range_index is not between 0 and 4
+        """
+        if not 0 <= range_index <= 4:
+            raise ValueError("Range index must be between 0 and 4")
+        self._send_command(f"CH{channel}:IRANGE {range_index}")
+
+    def set_current_range_by_limit(self, channel: int, max_current: float,
+                                    disable_autorange: bool = True) -> int:
+        """
+        Set the current range based on the maximum expected current
+
+        Automatically selects the smallest range that can accommodate the specified
+        maximum current, providing the best resolution for that current level.
+
+        Available ranges:
+            0: ± 1 µA
+            1: ± 25 µA
+            2: ± 650 µA
+            3: ± 15 mA
+            4: ± 180 mA
+
+        Args:
+            channel: Channel number (1 or 2)
+            max_current: Maximum expected current magnitude in amperes (absolute value)
+            disable_autorange: If True, automatically disables autoranging before
+                              setting the range (default: True)
+
+        Returns:
+            The selected range index (0-4)
+
+        Raises:
+            ValueError: If max_current exceeds the maximum range (180 mA)
+
+        Example:
+            # For measurements up to 10 mA, this will select range 3 (± 15 mA)
+            selected = smu.set_current_range_by_limit(1, 0.010)
+            print(f"Selected range: {selected}")  # Prints: Selected range: 3
+
+            # For measurements up to 500 µA, this will select range 2 (± 650 µA)
+            selected = smu.set_current_range_by_limit(1, 500e-6)
+        """
+        max_current = abs(max_current)
+
+        # Find the smallest range that can accommodate the current
+        selected_range = None
+        for range_index in sorted(CURRENT_RANGE_LIMITS.keys()):
+            if max_current <= CURRENT_RANGE_LIMITS[range_index]:
+                selected_range = range_index
+                break
+
+        if selected_range is None:
+            raise ValueError(
+                f"max_current ({max_current} A) exceeds maximum range limit "
+                f"({CURRENT_RANGE_LIMITS[4]} A = 180 mA)"
+            )
+
+        if disable_autorange:
+            self.set_autorange(channel, False)
+
+        self.set_current_range(channel, selected_range)
+        return selected_range
+
+    def get_current_range_limit(self, range_index: int) -> float:
+        """
+        Get the current limit for a specific range index
+
+        Args:
+            range_index: Range index (0-4)
+
+        Returns:
+            Maximum current magnitude in amperes for the specified range
+
+        Raises:
+            ValueError: If range_index is not between 0 and 4
+        """
+        if range_index not in CURRENT_RANGE_LIMITS:
+            raise ValueError("Range index must be between 0 and 4")
+        return CURRENT_RANGE_LIMITS[range_index]
 
     def set_mode(self, channel: int, mode: str):
         """
