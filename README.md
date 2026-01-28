@@ -7,6 +7,7 @@ A comprehensive Python library for controlling the miniSMU MS01 Source Measure U
 - **Dual Connectivity**: USB (CDC) and WiFi (TCP) connections
 - **Complete SMU Control**: Voltage/current sourcing, measurement, and channel management
 - **Advanced Measurement Features**: Configurable oversampling ratio (OSR) for precision control
+- **Manual Current Range Control**: Disable auto-ranging and select specific current ranges for optimal resolution
 - **Safety Protection**: Current and voltage protection limits
 - **Onboard I-V Sweeps**: Hardware-accelerated sweeps with progress monitoring (firmware v1.3.4+)
 - **4-Wire (Kelvin) Measurements**: High-accuracy measurements eliminating lead resistance errors (firmware v1.4.3+)
@@ -113,6 +114,60 @@ voltage, current = smu.measure_voltage_and_current(1)
 ```python
 # Set oversampling ratio (0-15, represents approx. 2^OSR samples)
 smu.set_oversampling_ratio(1, 12)
+```
+
+### Manual Current Range Control
+
+By default, the miniSMU automatically switches between current ranges for optimal measurement. You can disable this and manually select a specific range for consistent measurements or optimal resolution.
+
+#### Available Current Ranges
+| Range | Current Limit |
+|-------|---------------|
+| 0     | ± 1 µA        |
+| 1     | ± 25 µA       |
+| 2     | ± 650 µA      |
+| 3     | ± 15 mA       |
+| 4     | ± 180 mA      |
+
+#### Manual Range Selection
+```python
+from minismu_py import SMU, ConnectionType, CURRENT_RANGE_LIMITS
+
+with SMU(ConnectionType.USB, port="COM3") as smu:
+    # Disable autoranging and set a specific range
+    smu.set_autorange(1, False)
+    smu.set_current_range(1, 2)  # Range 2: ± 650 µA
+
+    # Take measurements with fixed range
+    voltage, current = smu.measure_voltage_and_current(1)
+
+    # Re-enable autoranging when done
+    smu.set_autorange(1, True)
+```
+
+#### Range Selection by Expected Current
+```python
+# Automatically select the optimal range for your expected current
+# This also disables autoranging automatically
+selected_range = smu.set_current_range_by_limit(1, 10e-3)  # For up to 10 mA
+print(f"Selected range: {selected_range}")  # Prints: 3 (± 15 mA range)
+
+# For microamp-level measurements
+selected_range = smu.set_current_range_by_limit(1, 500e-6)  # For up to 500 µA
+print(f"Selected range: {selected_range}")  # Prints: 2 (± 650 µA range)
+```
+
+#### Accessing Range Limits Programmatically
+```python
+from minismu_py import CURRENT_RANGE_LIMITS
+
+# Get limit for a specific range
+limit = smu.get_current_range_limit(2)  # Returns 650e-6 (650 µA)
+
+# Or access the dictionary directly
+for range_idx, limit in CURRENT_RANGE_LIMITS.items():
+    print(f"Range {range_idx}: ± {limit * 1e6:.0f} µA" if limit < 1e-3
+          else f"Range {range_idx}: ± {limit * 1e3:.0f} mA")
 ```
 
 ### Data Streaming
@@ -280,6 +335,7 @@ The `examples/` directory contains comprehensive examples demonstrating various 
 - **`basic_usage.py`** - Simple voltage setting and measurement
 - **`streaming_example.py`** - Real-time data streaming
 - **`current_sweep.py`** - Manual current sweep implementation
+- **`manual_current_range.py`** - Manual current range control and selection
 
 ### I-V Sweep Examples
 - **`usb_iv_sweep.py`** - Manual I-V sweep over USB with progress bars
@@ -408,6 +464,12 @@ SMU(connection_type, port="/dev/ttyACM0", host="192.168.1.1", tcp_port=3333)
 - `set_voltage_protection(channel, limit)` - Voltage protection limit
 - `set_oversampling_ratio(channel, osr)` - Measurement precision (0-15)
 
+### Current Range Control
+- `set_autorange(channel, enabled)` - Enable/disable automatic current range switching
+- `set_current_range(channel, range_index)` - Manually set current range (0-4)
+- `set_current_range_by_limit(channel, max_current)` - Auto-select range based on expected current (returns selected range)
+- `get_current_range_limit(range_index)` - Get the current limit for a range index
+
 ### I-V Sweep Methods
 - `run_iv_sweep()` - Complete sweep operation
 - `configure_iv_sweep()` - Setup sweep parameters
@@ -450,6 +512,12 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - **Website**: [www.undalogic.com](http://www.undalogic.com)
 
 ## Changelog
+
+### v0.3.1
+- Added manual current range control for disabling auto-ranging and selecting specific ranges
+- New methods: `set_autorange()`, `set_current_range()`, `set_current_range_by_limit()`, `get_current_range_limit()`
+- New `CURRENT_RANGE_LIMITS` constant for programmatic access to range limits
+- New example `manual_current_range.py` demonstrating manual range control
 
 ### v0.3.0
 - Added 4-wire (Kelvin) measurement mode for high-accuracy measurements (firmware v1.4.3+)
