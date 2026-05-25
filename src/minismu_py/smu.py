@@ -2,8 +2,9 @@ import serial
 import socket
 import time
 import json
+import re
 from enum import Enum
-from typing import Tuple, Union, List
+from typing import Optional, Tuple, Union, List
 from dataclasses import dataclass
 
 @dataclass
@@ -75,7 +76,15 @@ class SMU:
         """
         self.connection_type = connection_type
         self._connection = None
-        
+
+        # Detected firmware version from *IDN?, or None if we couldn't parse it.
+        self.firmware_version: Optional[Tuple[int, int, int]] = None
+        # What to append to a TCP command before sending. Firmware 1.4.6 added
+        # strict LF-delimited command parsing; older firmware tolerated either,
+        # so we keep "" for pre-1.4.6 to match the historical wire shape and
+        # only opt into "\n" once we've confirmed the device understands it.
+        self._tcp_command_suffix = "\n"
+
         if connection_type == ConnectionType.USB:
             try:
                 self._connection = serial.Serial(port, 115200, timeout=1)
@@ -88,6 +97,42 @@ class SMU:
                 self._connection.settimeout(1.0)
             except socket.error as e:
                 raise SMUException(f"Failed to open network connection: {e}")
+
+            # Probe firmware version. Use "\n" for the probe itself: pre-1.4.6
+            # firmware tolerates it (strips trailing whitespace), 1.4.6+
+            # requires it - so "\n" works against any version we care about.
+            self._detect_firmware_version_over_tcp()
+
+    @staticmethod
+    def _parse_firmware_version(idn: str) -> Optional[Tuple[int, int, int]]:
+        """Extract (major, minor, patch) from an *IDN? response, or None."""
+        if not idn:
+            return None
+        m = re.search(r'v(\d+)\.(\d+)\.(\d+)', idn)
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    def _detect_firmware_version_over_tcp(self) -> None:
+        """Probe *IDN?, parse the version, and pick the TCP command suffix.
+
+        On any failure we keep the default suffix ("\n"), which is the safer
+        bet for unknown firmware - 1.4.6+ requires it, older firmware
+        tolerates it.
+        """
+        try:
+            self._connection.sendall(b"*IDN?\n")
+            idn = self._connection.recv(1024).decode(errors='replace').strip()
+        except (socket.error, UnicodeDecodeError):
+            return
+
+        version = self._parse_firmware_version(idn)
+        if version is None:
+            return
+
+        self.firmware_version = version
+        if version < (1, 4, 6):
+            self._tcp_command_suffix = ""
 
     def _send_command(self, command: str) -> str:
         """
@@ -104,7 +149,7 @@ class SMU:
                 self._connection.write(f"{command}\n".encode())
                 response = self._read_usb_response(command)
             else:
-                self._connection.send(f"{command}".encode())
+                self._connection.sendall(f"{command}{self._tcp_command_suffix}".encode())
                 response = self._connection.recv(1024).decode().strip()
             
             # Check if response is an acknowledgment

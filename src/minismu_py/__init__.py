@@ -4,7 +4,7 @@ from .smu import (
     CURRENT_RANGE_LIMITS
 )
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 __all__ = [
     "SMU", "ConnectionType", "SMUException", "WifiStatus",
     "SweepStatus", "SweepConfig", "SweepDataPoint", "SweepResult",
