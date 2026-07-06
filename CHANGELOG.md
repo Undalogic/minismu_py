@@ -62,7 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Firmware v1.5.0 reports WiFi status as `{"status": "Connected", ...}`
   with no RSSI field; `get_wifi_status()` now understands this shape
   (previously it always reported `connected=False`), and `rssi` is 0 when
-  the firmware doesn't provide it.
+  the firmware doesn't provide it. Verified against v1.4.6 as well, which
+  uses the same schema.
+- Firmware v1.4.6 does not validate channel numbers (it acknowledges e.g.
+  `SOUR9:VOLT` with `OK`), so invalid-channel mistakes only raise on
+  v1.5.0+, where the firmware reports them.
 
 ## [0.3.0] - 2025-11-26
 
