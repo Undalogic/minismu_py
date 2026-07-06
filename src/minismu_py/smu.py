@@ -84,16 +84,23 @@ class SMU:
         # so we keep "" for pre-1.4.6 to match the historical wire shape and
         # only opt into "\n" once we've confirmed the device understands it.
         self._tcp_command_suffix = "\n"
+        # Receive buffer for line-based TCP reads. TCP is a byte stream, so
+        # responses can arrive fragmented or coalesced; leftover bytes from
+        # one recv() are kept here for the next read.
+        self._tcp_buffer = b""
+        # How long to wait for the first line of a command response
+        self._response_timeout = 1.0
 
         if connection_type == ConnectionType.USB:
             try:
                 self._connection = serial.Serial(port, 115200, timeout=1)
+                # Discard stale data a previous session may have left behind
+                self._connection.reset_input_buffer()
             except serial.SerialException as e:
                 raise SMUException(f"Failed to open USB connection: {e}")
         else:
             try:
-                self._connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._connection.connect((host, tcp_port))
+                self._connection = socket.create_connection((host, tcp_port), timeout=5.0)
                 self._connection.settimeout(1.0)
             except socket.error as e:
                 raise SMUException(f"Failed to open network connection: {e}")
@@ -122,8 +129,8 @@ class SMU:
         """
         try:
             self._connection.sendall(b"*IDN?\n")
-            idn = self._connection.recv(1024).decode(errors='replace').strip()
-        except (socket.error, UnicodeDecodeError):
+            idn = self._tcp_readline(self._response_timeout)
+        except socket.error:
             return
 
         version = self._parse_firmware_version(idn)
@@ -137,139 +144,246 @@ class SMU:
     def _send_command(self, command: str) -> str:
         """
         Send command and get response
-        
+
         Args:
             command: Command string to send
-            
+
         Returns:
             Response from device
+
+        Raises:
+            SMUException: On a communication failure, or if the device
+                reports an error for the command
         """
+        self._write_command(command)
         try:
-            if self.connection_type == ConnectionType.USB:
-                self._connection.write(f"{command}\n".encode())
-                response = self._read_usb_response(command)
-            else:
-                self._connection.sendall(f"{command}{self._tcp_command_suffix}".encode())
-                response = self._connection.recv(1024).decode().strip()
-            
-            # Check if response is an acknowledgment
-            if response == "OK":
-                return response
-                
-            # For query commands (ending with ?), return the raw response
-            if command.endswith("?"):
-                return response
-                
-            # For other commands, return the response
-            return response
-            
+            response = self._read_response(command)
         except (serial.SerialException, socket.error) as e:
             raise SMUException(f"Communication error: {e}")
 
-    def _read_usb_response(self, command: str) -> str:
+        if command.endswith("?"):
+            # Query: data response expected; explicit errors are prefixed
+            if response.startswith("ERROR"):
+                raise SMUException(f"Device error for '{command}': {response}")
+            return response
+
+        # Non-query commands are acknowledged with "OK"; anything else is an
+        # error report (e.g. "Invalid channel number", "ERROR: ...")
+        if response != "OK":
+            raise SMUException(f"Device error for '{command}': {response!r}")
+
+        return response
+
+    def _write_command(self, command: str):
+        """Send a command without reading a response."""
+        try:
+            if self.connection_type == ConnectionType.USB:
+                self._connection.write(f"{command}\n".encode())
+            else:
+                self._connection.sendall(f"{command}{self._tcp_command_suffix}".encode())
+        except (serial.SerialException, socket.error) as e:
+            raise SMUException(f"Communication error: {e}")
+
+    def _readline(self, timeout: float, partial_ok: bool = True) -> str:
+        """Read one newline-terminated line, decoded and stripped.
+
+        Returns "" if no line arrived within the timeout.
+
+        Args:
+            timeout: Max quiet time (no bytes arriving) to wait for
+            partial_ok: On timeout with an incomplete line buffered, whether
+                to return the partial line (True) or keep it buffered for the
+                next read (False). Only meaningful for TCP; pyserial's
+                readline always returns partial data on timeout.
         """
-        Read USB response with support for chunked JSON data
-        
+        if self.connection_type == ConnectionType.USB:
+            return self._usb_readline(timeout)
+        return self._tcp_readline(timeout, partial_ok)
+
+    def _usb_readline(self, timeout: float) -> str:
+        original_timeout = self._connection.timeout
+        try:
+            self._connection.timeout = timeout
+            raw = self._connection.readline()
+        finally:
+            self._connection.timeout = original_timeout
+        return raw.decode('utf-8', errors='replace').strip()
+
+    def _tcp_readline(self, timeout: float, partial_ok: bool = True) -> str:
+        """Read one LF-terminated line from the socket.
+
+        Buffers raw bytes across recv() calls so that fragmented or
+        coalesced responses are reassembled correctly. The timeout counts
+        quiet time: it restarts whenever bytes arrive, so a line delivered
+        across several slow segments is not sheared mid-line.
+
+        If the link goes quiet with an incomplete line buffered, the partial
+        data is returned when partial_ok is True (compat fallback for
+        firmware that doesn't newline-terminate a response), otherwise it
+        stays buffered for the next read and "" is returned.
+        """
+        deadline = time.monotonic() + timeout
+        while b"\n" not in self._tcp_buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Link went quiet without a complete line
+                if partial_ok and self._tcp_buffer:
+                    line = self._tcp_buffer.decode('utf-8', errors='replace').strip()
+                    self._tcp_buffer = b""
+                    return line
+                return ""
+            self._connection.settimeout(remaining)
+            try:
+                chunk = self._connection.recv(4096)
+            except socket.timeout:
+                continue  # deadline check above handles the fallback
+            if not chunk:
+                # Connection closed - return any remaining buffered data
+                line = self._tcp_buffer.decode('utf-8', errors='replace').strip()
+                self._tcp_buffer = b""
+                return line
+            self._tcp_buffer += chunk
+            deadline = time.monotonic() + timeout  # data arrived; restart quiet timer
+        line, _, self._tcp_buffer = self._tcp_buffer.partition(b"\n")
+        return line.decode('utf-8', errors='replace').strip()
+
+    def _flush_partial_line(self) -> str:
+        """Return and clear any buffered partial line (TCP only)."""
+        if self.connection_type == ConnectionType.USB:
+            return ""
+        line = self._tcp_buffer.decode('utf-8', errors='replace').strip()
+        self._tcp_buffer = b""
+        return line
+
+    def _read_response(self, command: str) -> str:
+        """
+        Read a complete response for the given command
+
         Args:
             command: Original command sent (used to detect expected response type)
-            
+
         Returns:
             Complete response from device
         """
-        response_buffer = []
+        initial_response = self._readline(self._response_timeout)
+
+        # JSON responses (sweep data, WiFi status/scan) may span multiple chunks
+        if initial_response.startswith('{') or initial_response.startswith('['):
+            return self._read_json_response(initial_response)
+
+        # CSV sweep data spans multiple lines; read until the link goes quiet
+        if initial_response and command.upper().endswith("SWEEP:DATA?"):
+            return self._read_multiline_response(initial_response)
+
+        return initial_response
+
+    def _read_multiline_response(self, first_line: str) -> str:
+        """Accumulate a multi-line response until no new lines arrive."""
+        lines = [first_line]
+        quiet_reads = 0
+        while quiet_reads < 3:  # ~600ms of silence ends the response
+            line = self._readline(0.2, partial_ok=False)
+            if line:
+                lines.append(line)
+                quiet_reads = 0
+            else:
+                quiet_reads += 1
+        # Device stopped mid-line? Surface the partial data rather than drop it
+        tail = self._flush_partial_line()
+        if tail:
+            lines.append(tail)
+        return '\n'.join(lines)
+
+    def _read_json_response(self, initial_response: str) -> str:
+        """
+        Accumulate a possibly-chunked JSON response until it parses
+
+        Args:
+            initial_response: First line of the response (starts with '{' or '[')
+
+        Returns:
+            Complete response from device
+        """
+        response_buffer = [initial_response]
         timeout_count = 0
-        max_timeout_iterations = 10  # Max iterations before giving up
-        
-        # First, try to read the initial response with robust decoding
-        try:
-            initial_response = self._connection.readline().decode('utf-8', errors='replace').strip()
-        except UnicodeDecodeError:
-            # Fallback for severely corrupted data
-            raw_data = self._connection.readline()
-            initial_response = raw_data.decode('utf-8', errors='ignore').strip()
-        
-        # If it's a simple response (not JSON), return immediately
-        if not initial_response.startswith('{') and not initial_response.startswith('['):
-            return initial_response
-        
-        # This looks like JSON - we might need to read more chunks
-        response_buffer.append(initial_response)
-        
-        # Try to parse as JSON to see if it's complete
-        current_response = ''.join(response_buffer)
-        
+        max_timeout_iterations = 10  # Max quiet reads before giving up
+
         # Quick check: if it looks like complete JSON, try parsing it
-        if self._is_likely_complete_json(current_response):
+        if self._is_likely_complete_json(initial_response):
             try:
-                json.loads(current_response)
-                return current_response  # Successfully parsed, it's complete
+                json.loads(initial_response)
+                return initial_response  # Successfully parsed, it's complete
             except json.JSONDecodeError:
                 pass  # Not complete yet, continue reading
-        
+
         # Read additional chunks until we have complete JSON or timeout
         while timeout_count < max_timeout_iterations:
-            try:
-                # Set a shorter timeout for additional chunks
-                original_timeout = self._connection.timeout
-                self._connection.timeout = 0.1  # 100ms timeout for chunk reading
-                
-                # Read chunk with robust decoding
-                try:
-                    chunk = self._connection.readline().decode('utf-8', errors='replace').strip()
-                except UnicodeDecodeError:
-                    # Fallback for severely corrupted chunks
-                    raw_chunk = self._connection.readline()
-                    chunk = raw_chunk.decode('utf-8', errors='ignore').strip()
-                
-                # Restore original timeout
-                self._connection.timeout = original_timeout
-                
-                if chunk:
-                    # Only append non-empty, valid chunks
-                    if chunk.strip() and self._is_valid_chunk(chunk):
-                        response_buffer.append(chunk)
-                    timeout_count = 0  # Reset timeout counter since we got data
-                    
-                    # Try to parse the accumulated response
-                    current_response = ''.join(response_buffer)
-                    try:
-                        json.loads(current_response)
-                        return current_response  # Successfully parsed complete JSON
-                    except json.JSONDecodeError:
-                        # Try cleaning the JSON in case of corruption
-                        try:
-                            cleaned_response = self._clean_json_response(current_response)
-                            json.loads(cleaned_response)
-                            return cleaned_response  # Successfully parsed cleaned JSON
-                        except json.JSONDecodeError:
-                            continue  # Not complete yet, keep reading
-                else:
-                    timeout_count += 1
-                    
-            except serial.SerialTimeoutException:
+            chunk = self._readline(0.1, partial_ok=False)
+            if not chunk:
                 timeout_count += 1
                 continue
-        
-        # If we get here, either we have a complete response or we timed out
-        final_response = ''.join(response_buffer)
-        
-        # Final attempt to validate and clean JSON
-        if final_response.startswith('{') or final_response.startswith('['):
+
+            # Only append non-empty, valid chunks
+            if self._is_valid_chunk(chunk):
+                response_buffer.append(chunk)
+            timeout_count = 0  # Reset timeout counter since we got data
+
+            # Try to parse the accumulated response
+            current_response = ''.join(response_buffer)
             try:
-                json.loads(final_response)
-                return final_response
+                json.loads(current_response)
+                return current_response  # Successfully parsed complete JSON
             except json.JSONDecodeError:
-                # Try cleaning the JSON for known corruption issues
+                # Try cleaning the JSON in case of corruption
                 try:
-                    cleaned_response = self._clean_json_response(final_response)
-                    json.loads(cleaned_response)  # Validate cleaned version
-                    return cleaned_response
+                    cleaned_response = self._clean_json_response(current_response)
+                    json.loads(cleaned_response)
+                    return cleaned_response  # Successfully parsed cleaned JSON
                 except json.JSONDecodeError:
-                    # JSON is incomplete or severely corrupted
-                    # Return as-is to maintain compatibility
+                    continue  # Not complete yet, keep reading
+
+        # Timed out - final attempt to validate and clean what we have,
+        # including any unterminated trailing data still buffered
+        tail = self._flush_partial_line()
+        if tail:
+            response_buffer.append(tail)
+        final_response = ''.join(response_buffer)
+        try:
+            json.loads(final_response)
+            return final_response
+        except json.JSONDecodeError:
+            try:
+                cleaned_response = self._clean_json_response(final_response)
+                json.loads(cleaned_response)  # Validate cleaned version
+                return cleaned_response
+            except json.JSONDecodeError:
+                # JSON is incomplete or severely corrupted
+                # Return as-is to maintain compatibility
+                return final_response
+
+    def _drain_input(self):
+        """Discard buffered and in-flight data until the link goes quiet.
+
+        Used to resynchronise the request/response pairing after operations
+        that leave unsolicited data in flight (e.g. stopping a stream).
+        """
+        if self.connection_type == ConnectionType.USB:
+            original_timeout = self._connection.timeout
+            try:
+                self._connection.timeout = 0.2
+                while self._connection.read(4096):
                     pass
-        
-        return final_response
+            finally:
+                self._connection.timeout = original_timeout
+            self._connection.reset_input_buffer()
+        else:
+            self._tcp_buffer = b""
+            self._connection.settimeout(0.2)
+            try:
+                while self._connection.recv(4096):
+                    pass
+            except socket.timeout:
+                pass
     
     def _is_likely_complete_json(self, text: str) -> bool:
         """
@@ -334,8 +448,6 @@ class SMU:
         Returns:
             Cleaned JSON string
         """
-        import re
-        
         # Replace corrupted IP addresses with placeholder
         # Pattern matches corrupted Unicode sequences in IP field
         ip_pattern = r'"ip":\s*"[^"]*[\u0000-\u001f\u007f-\u009f][^"]*"'
@@ -357,8 +469,12 @@ class SMU:
         return self._send_command("*IDN?")
 
     def reset(self):
-        """Reset the device"""
-        self._send_command("*RST")
+        """Reset the device
+
+        The device reboots and (over USB) re-enumerates, so this connection
+        is no longer valid afterwards; create a new SMU instance to continue.
+        """
+        self._write_command("*RST")
 
     # Source and Measurement Methods
     def set_voltage(self, channel: int, voltage: float):
@@ -412,7 +528,10 @@ class SMU:
             Measured voltage in volts
         """
         response = self._send_command(f"MEAS{channel}:VOLT?")
-        return float(response)
+        try:
+            return float(response)
+        except ValueError:
+            raise SMUException(f"Unexpected response to MEAS{channel}:VOLT?: {response!r}")
 
     def measure_current(self, channel: int) -> float:
         """
@@ -425,7 +544,10 @@ class SMU:
             Measured current in amperes
         """
         response = self._send_command(f"MEAS{channel}:CURR?")
-        return float(response)
+        try:
+            return float(response)
+        except ValueError:
+            raise SMUException(f"Unexpected response to MEAS{channel}:CURR?: {response!r}")
     
     def measure_voltage_and_current(self, channel: int) -> Tuple[float, float]:
         """
@@ -438,7 +560,10 @@ class SMU:
             Tuple of (voltage, current)
         """
         response = self._send_command(f"MEAS{channel}:VOLT:CURR?")
-        voltage, current = map(float, response.split(','))
+        try:
+            voltage, current = map(float, response.split(','))
+        except ValueError:
+            raise SMUException(f"Unexpected response to MEAS{channel}:VOLT:CURR?: {response!r}")
         return voltage, current
 
     def set_oversampling_ratio(self, channel: int, osr: int):
@@ -608,24 +733,35 @@ class SMU:
         self._send_command(f"SOUR{channel}:DATA:STREAM ON")
 
     def stop_streaming(self, channel: int):
-        """Stop data streaming for specified channel"""
-        self._send_command(f"SOUR{channel}:DATA:STREAM OFF")
+        """Stop data streaming for specified channel
+
+        Streamed data packets still in flight (including any interleaved with
+        the command acknowledgment) are discarded, so that subsequent commands
+        see clean responses. The acknowledgment itself is not validated, since
+        it cannot be distinguished from in-flight data packets.
+        """
+        self._write_command(f"SOUR{channel}:DATA:STREAM OFF")
+        self._drain_input()
 
     def read_streaming_data(self) -> Tuple[int, float, float, float]:
         """
         Read a single data packet from the streaming buffer
-        
+
         Returns:
             Tuple of (channel, timestamp, voltage, current) from the streaming data
         """
         if self.connection_type == ConnectionType.USB:
-            # Read the data packet
-            data = self._connection.readline().decode().strip()
+            # Read the data packet. Firmware v1.5.0+ appends extra fields
+            # (e.g. the active current range) after the first four; ignore them.
+            data = self._connection.readline().decode('utf-8', errors='replace').strip()
+            parts = data.split(',')
             try:
-                channel, timestamp, voltage, current = data.split(',')
+                if len(parts) < 4:
+                    raise ValueError
+                channel, timestamp, voltage, current = parts[:4]
                 return int(channel), float(timestamp), float(voltage), float(current)
-            except ValueError as e:
-                raise SMUException(f"Failed to parse streaming data: {data}")
+            except ValueError:
+                raise SMUException(f"Failed to parse streaming data: {data!r}")
         else:
             raise SMUException("Streaming is only supported over USB connection")
 
@@ -654,7 +790,10 @@ class SMU:
     def get_led_brightness(self) -> int:
         """Get current LED brightness"""
         response = self._send_command("SYST:LED?")
-        return int(response)
+        try:
+            return int(response)
+        except ValueError:
+            raise SMUException(f"Unexpected response to SYST:LED?: {response!r}")
 
     def get_temperatures(self) -> Tuple[float, float, float]:
         """
@@ -664,7 +803,11 @@ class SMU:
             Tuple of (adc_temp, channel1_temp, channel2_temp)
         """
         response = self._send_command("SYST:TEMP?")
-        return tuple(map(float, response.split(',')))
+        try:
+            adc_temp, ch1_temp, ch2_temp = map(float, response.split(','))
+        except ValueError:
+            raise SMUException(f"Unexpected response to SYST:TEMP?: {response!r}")
+        return adc_temp, ch1_temp, ch2_temp
 
     def set_time(self, timestamp: int):
         """
@@ -694,9 +837,7 @@ class SMU:
         Raises:
             SMUException: If 4-wire mode cannot be enabled (streaming/sweep active)
         """
-        response = self._send_command("SYST:4WIR ENA")
-        if response.startswith("ERROR"):
-            raise SMUException(response)
+        self._send_command("SYST:4WIR ENA")
 
     def disable_fourwire_mode(self):
         """
@@ -707,9 +848,7 @@ class SMU:
         - Both channels can be controlled independently
         - Measurements return values from the measured channel only
         """
-        response = self._send_command("SYST:4WIR DIS")
-        if response.startswith("ERROR"):
-            raise SMUException(response)
+        self._send_command("SYST:4WIR DIS")
 
     def get_fourwire_mode(self) -> bool:
         """
@@ -730,7 +869,10 @@ class SMU:
             List of available networks
         """
         response = self._send_command("SYST:WIFI:SCAN?")
-        return json.loads(response)
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError as e:
+            raise SMUException(f"Malformed WiFi scan response: {e}")
 
     def get_wifi_status(self) -> WifiStatus:
         """
@@ -740,9 +882,18 @@ class SMU:
             WifiStatus object with connection details
         """
         response = self._send_command("SYST:WIFI?")
-        status_dict = json.loads(response)
+        try:
+            status_dict = json.loads(response)
+        except json.JSONDecodeError as e:
+            raise SMUException(f"Malformed WiFi status response: {e}")
+        # Firmware v1.5.0 reports {"status": "Connected", ...} rather than a
+        # boolean "connected" field; accept either shape
+        if 'connected' in status_dict:
+            connected = bool(status_dict['connected'])
+        else:
+            connected = status_dict.get('status', '') == 'Connected'
         return WifiStatus(
-            connected=status_dict.get('connected', False),
+            connected=connected,
             ssid=status_dict.get('ssid', ''),
             ip_address=status_dict.get('ip', ''),
             rssi=status_dict.get('rssi', 0)
@@ -755,7 +906,14 @@ class SMU:
         Args:
             ssid: Network SSID
             password: Network password
+
+        Raises:
+            ValueError: If the SSID or password contains characters that would
+                break the command framing (double quotes or newlines)
         """
+        for name, value in (("SSID", ssid), ("password", password)):
+            if any(c in value for c in ('"', '\n', '\r')):
+                raise ValueError(f"WiFi {name} must not contain double quotes or newlines")
         self._send_command(f'SYST:WIFI:SSID "{ssid}"')
         self._send_command(f'SYST:WIFI:PASS "{password}"')
 
@@ -894,15 +1052,18 @@ class SMU:
         response = self._send_command(f"SOUR{channel}:SWEEP:STATUS?")
         parts = response.split(',')
         if len(parts) != 5:
-            raise SMUException(f"Invalid sweep status response: {response}")
-        
-        return SweepStatus(
-            status=parts[0],
-            current_point=int(parts[1]),
-            total_points=int(parts[2]),
-            elapsed_ms=int(parts[3]),
-            estimated_remaining_ms=int(parts[4])
-        )
+            raise SMUException(f"Invalid sweep status response: {response!r}")
+
+        try:
+            return SweepStatus(
+                status=parts[0],
+                current_point=int(parts[1]),
+                total_points=int(parts[2]),
+                elapsed_ms=int(parts[3]),
+                estimated_remaining_ms=int(parts[4])
+            )
+        except ValueError:
+            raise SMUException(f"Invalid sweep status response: {response!r}")
 
     def get_sweep_data_raw(self, channel: int) -> str:
         """Get raw sweep data in configured format"""
@@ -927,29 +1088,63 @@ class SMU:
             if line.strip():
                 parts = line.split(',')
                 if len(parts) >= 3:
-                    data_points.append(SweepDataPoint(
-                        timestamp=int(float(parts[0])),
-                        voltage=float(parts[1]),
-                        current=float(parts[2])
-                    ))
-        
+                    try:
+                        data_points.append(SweepDataPoint(
+                            timestamp=int(float(parts[0])),
+                            voltage=float(parts[1]),
+                            current=float(parts[2])
+                        ))
+                    except ValueError:
+                        raise SMUException(
+                            f"Malformed CSV sweep data line "
+                            f"(response may be truncated): {line!r}")
+
+        # Verify completeness: a truncated response can still parse cleanly
+        # (e.g. sheared mid-line at a spot that yields a plausible number)
+        status = self.get_sweep_status(channel)
+        if status.status == "COMPLETED" and len(data_points) != status.total_points:
+            message = (f"CSV sweep data is incomplete: got {len(data_points)} of "
+                       f"{status.total_points} points")
+            if self.connection_type == ConnectionType.NETWORK:
+                message += (". Firmware v1.5.0 and earlier truncate responses "
+                            "larger than ~5.7 kB over TCP (~175 CSV points); "
+                            "use fewer points or a USB connection")
+            raise SMUException(message)
+
         return data_points
 
     def get_sweep_data_json(self, channel: int) -> SweepResult:
         """
         Get sweep data in JSON format parsed into SweepResult object
-        
+
+        Note: firmware v1.5.0 and earlier truncate responses larger than
+        ~5.7 kB over network connections (roughly 95 sweep points in JSON
+        format, ~175 in CSV). For larger sweeps, use a USB connection.
+
         Returns:
             SweepResult object with configuration and data
+
+        Raises:
+            SMUException: If the sweep data is truncated or malformed
         """
         # Ensure JSON format is set
         self.set_sweep_output_format(channel, "JSON")
-        
+
         # Get raw data
         raw_data = self.get_sweep_data_raw(channel)
-        
+
         # Parse JSON data
-        json_data = json.loads(raw_data)
+        try:
+            json_data = json.loads(raw_data)
+        except json.JSONDecodeError as e:
+            message = (f"Sweep data JSON is truncated or malformed "
+                       f"(received {len(raw_data)} chars): {e}")
+            if self.connection_type == ConnectionType.NETWORK:
+                message += (". Firmware v1.5.0 and earlier truncate responses "
+                            "larger than ~5.7 kB over TCP (~95 JSON points); "
+                            "use CSV format (fits ~175 points), fewer points, "
+                            "or a USB connection")
+            raise SMUException(message)
         
         # Create config object
         config_data = json_data['sweep_config']
@@ -986,48 +1181,71 @@ class SMU:
             points: Number of measurement points (max 1000)
             dwell_ms: Dwell time between measurements in milliseconds
             auto_enable: Enable automatic output control during sweep
-            output_format: Output format ("CSV" or "JSON")
+            output_format: Output format ("CSV" or "JSON"). Note: firmware
+                v1.5.0 and earlier truncate responses larger than ~5.7 kB over
+                network connections (roughly 95 points in JSON format, ~175 in
+                CSV); use USB for larger sweeps.
             monitor_progress: Print progress updates during sweep
-            
+
         Returns:
             List[SweepDataPoint] for CSV format or SweepResult for JSON format
+
+        Raises:
+            SMUException: If the sweep is aborted or doesn't complete within
+                the expected duration plus a 30 second margin
         """
         # Configure sweep
-        self.configure_iv_sweep(channel, start_voltage, end_voltage, points, 
+        self.configure_iv_sweep(channel, start_voltage, end_voltage, points,
                                dwell_ms, auto_enable, output_format)
-        
+
         # Execute sweep
         self.execute_sweep(channel)
-        
-        # Monitor progress if requested
+
         if monitor_progress:
             print(f"Starting I-V sweep: {start_voltage}V to {end_voltage}V, {points} points")
-            
-            while True:
-                status = self.get_sweep_status(channel)
-                
-                if status.status == "RUNNING":
-                    progress = (status.current_point / status.total_points) * 100
-                    remaining_sec = status.estimated_remaining_ms / 1000
-                    print(f"Progress: {progress:.1f}% ({status.current_point}/{status.total_points}), "
-                          f"~{remaining_sec:.1f}s remaining")
+
+        # Wait for completion. IDLE is ambiguous: the firmware reports it both
+        # before the sweep has started and after it has finished, so only treat
+        # it as completion once we've seen the sweep run (or waited longer than
+        # the sweep could possibly take to start and finish).
+        expected_duration_s = (points * dwell_ms) / 1000.0
+        start_time = time.monotonic()
+        deadline = start_time + expected_duration_s + 30.0
+        seen_running = False
+
+        while True:
+            status = self.get_sweep_status(channel)
+
+            if status.status == "RUNNING":
+                seen_running = True
+                if monitor_progress:
+                    if status.total_points > 0:
+                        progress = (status.current_point / status.total_points) * 100
+                        remaining_sec = status.estimated_remaining_ms / 1000
+                        print(f"Progress: {progress:.1f}% ({status.current_point}/{status.total_points}), "
+                              f"~{remaining_sec:.1f}s remaining")
                     time.sleep(1)
-                elif status.status == "COMPLETED":
-                    print("Sweep completed successfully!")
-                    break
-                elif status.status == "ABORTED":
-                    raise SMUException("Sweep was aborted")
                 else:
-                    # For other statuses, wait and check again
-                    time.sleep(0.5)
-        else:
-            # Wait for completion without monitoring
-            while True:
-                status = self.get_sweep_status(channel)
-                if status.status in ["COMPLETED", "ABORTED", "IDLE"]:
-                    break
-                time.sleep(0.5)
-        
+                    time.sleep(0.2)
+            elif status.status == "COMPLETED":
+                if monitor_progress:
+                    print("Sweep completed successfully!")
+                break
+            elif status.status == "ABORTED":
+                raise SMUException("Sweep was aborted")
+            elif status.status == "IDLE" and (
+                    seen_running or
+                    time.monotonic() - start_time > max(2.0, expected_duration_s)):
+                break
+            else:
+                # Not started yet or unknown status - wait and check again
+                time.sleep(0.2)
+
+            if time.monotonic() > deadline:
+                raise SMUException(
+                    f"Timed out waiting for sweep completion "
+                    f"(last status: {status.status})")
+
         # Retrieve and return data
         if output_format == "CSV":
             return self.get_sweep_data_csv(channel)

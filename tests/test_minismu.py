@@ -28,7 +28,13 @@ def test_measure_voltage_and_current(mock_serial):
     assert isinstance(voltage, float)
     assert isinstance(current, float)
 
-def test_invalid_voltage_range():
+def test_invalid_voltage_range(mock_serial):
     smu = SMU(ConnectionType.USB, port="/dev/ttyACM0")
     with pytest.raises(ValueError):
         smu.set_voltage_range(1, "INVALID")
+
+def test_device_error_raises(mock_serial):
+    mock_serial.readline.return_value = b"ERROR: Invalid channel\n"
+    smu = SMU(ConnectionType.USB, port="/dev/ttyACM0")
+    with pytest.raises(SMUException):
+        smu.set_voltage(3, 1.0)

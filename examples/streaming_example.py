@@ -117,9 +117,9 @@ def streaming_example(smu: SMU, channel: int = 1, duration: float = 10.0,
         return timestamps, voltages, currents
             
     finally:
-        # Always disable channel after measurement
-        smu.disable_channel(channel)
+        # Always stop streaming before sending further commands, then disable
         smu.stop_streaming(channel)
+        smu.disable_channel(channel)
 
 def main():
     # Connection parameters
