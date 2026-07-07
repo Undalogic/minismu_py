@@ -513,6 +513,19 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Changelog
 
+### v0.4.0
+- Fixed network (TCP) communication: responses are now buffered and reassembled correctly (previously anything larger than one packet, such as sweep data or WiFi scans, was truncated)
+- Fixed CSV sweep data retrieval returning only the first data point
+- Device-reported errors now raise `SMUException` instead of being silently ignored
+- Fixed streaming desynchronising the connection: `stop_streaming()` now discards in-flight data, and stale data is cleared on connect
+- Added support for firmware v1.5.0+ streaming packet format (extra trailing fields)
+- Fixed `get_wifi_status()` always reporting `connected=False`
+- Fixed `run_iv_sweep()` completion polling: no premature exit, no infinite loop, and a timeout with consistent abort handling
+- Detect sweep data truncated by the firmware's ~5.7 kB TCP response limit (firmware v1.5.0 and earlier) and raise a descriptive error instead of returning incomplete data — see CHANGELOG.md for details
+
+### v0.3.2
+- Better LAN reliability with firmware v1.4.6 and above
+
 ### v0.3.1
 - Added manual current range control for disabling auto-ranging and selecting specific ranges
 - New methods: `set_autorange()`, `set_current_range()`, `set_current_range_by_limit()`, `get_current_range_limit()`

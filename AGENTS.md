@@ -123,6 +123,8 @@ smu.set_current_range_by_limit(channel, 0.0005)  # Auto-select for 500µA max
 
 Hardware sweeps are faster and more consistent than software loops. Requires firmware v1.3.4+.
 
+Note: over WiFi/network connections with firmware v1.5.0 and earlier, keep sweeps to ~95 points (JSON format) or ~175 points (CSV format) — the firmware truncates larger responses over TCP and the library will raise `SMUException`. Over USB, any size works.
+
 ```python
 from minismu_py import SMU, ConnectionType
 
