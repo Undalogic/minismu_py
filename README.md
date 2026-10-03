@@ -513,6 +513,10 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Changelog
 
+### v0.4.1
+- Fixed `stop_streaming()` and sweep data reads hanging indefinitely while the device is still streaming; they now raise `SMUException` after a time limit ([#5](https://github.com/Undalogic/minismu_py/issues/5))
+- `stop_streaming()` now also stops a stream left running by a previous session
+
 ### v0.4.0
 - Fixed network (TCP) communication: responses are now buffered and reassembled correctly (previously anything larger than one packet, such as sweep data or WiFi scans, was truncated)
 - Fixed CSV sweep data retrieval returning only the first data point
