@@ -90,6 +90,12 @@ class SMU:
         self._tcp_buffer = b""
         # How long to wait for the first line of a command response
         self._response_timeout = 1.0
+        # Absolute cap on reading one multi-line/JSON response. The per-read
+        # timeouts only measure quiet time, so without this a device that
+        # never goes quiet (e.g. still streaming) would block forever.
+        self._max_response_time = 30.0
+        # Absolute cap on discarding in-flight data in _drain_input()
+        self._max_drain_time = 2.0
 
         if connection_type == ConnectionType.USB:
             try:
@@ -281,7 +287,10 @@ class SMU:
         """Accumulate a multi-line response until no new lines arrive."""
         lines = [first_line]
         quiet_reads = 0
+        deadline = time.monotonic() + self._max_response_time
         while quiet_reads < 3:  # ~600ms of silence ends the response
+            if time.monotonic() > deadline:
+                self._raise_response_overrun()
             line = self._readline(0.2, partial_ok=False)
             if line:
                 lines.append(line)
@@ -317,7 +326,10 @@ class SMU:
                 pass  # Not complete yet, continue reading
 
         # Read additional chunks until we have complete JSON or timeout
+        deadline = time.monotonic() + self._max_response_time
         while timeout_count < max_timeout_iterations:
+            if time.monotonic() > deadline:
+                self._raise_response_overrun()
             chunk = self._readline(0.1, partial_ok=False)
             if not chunk:
                 timeout_count += 1
@@ -361,18 +373,33 @@ class SMU:
                 # Return as-is to maintain compatibility
                 return final_response
 
+    def _raise_response_overrun(self):
+        raise SMUException(
+            f"Device kept sending data for over {self._max_response_time:g}s "
+            f"while reading a response; it may still be streaming "
+            f"(call stop_streaming() for each streaming channel)"
+        )
+
     def _drain_input(self):
         """Discard buffered and in-flight data until the link goes quiet.
 
         Used to resynchronise the request/response pairing after operations
         that leave unsolicited data in flight (e.g. stopping a stream).
+
+        Raises:
+            SMUException: If data is still arriving after _max_drain_time
+                seconds, e.g. because another channel is still streaming
         """
+        deadline = time.monotonic() + self._max_drain_time
+        quiet = False
         if self.connection_type == ConnectionType.USB:
             original_timeout = self._connection.timeout
             try:
                 self._connection.timeout = 0.2
-                while self._connection.read(4096):
-                    pass
+                while time.monotonic() < deadline:
+                    if not self._connection.read(4096):
+                        quiet = True
+                        break
             finally:
                 self._connection.timeout = original_timeout
             self._connection.reset_input_buffer()
@@ -380,10 +407,18 @@ class SMU:
             self._tcp_buffer = b""
             self._connection.settimeout(0.2)
             try:
-                while self._connection.recv(4096):
-                    pass
+                while time.monotonic() < deadline:
+                    if not self._connection.recv(4096):
+                        quiet = True  # connection closed
+                        break
             except socket.timeout:
-                pass
+                quiet = True
+
+        if not quiet:
+            raise SMUException(
+                f"Device still sending data after {self._max_drain_time:g}s; "
+                f"another channel may still be streaming"
+            )
     
     def _is_likely_complete_json(self, text: str) -> bool:
         """
@@ -739,7 +774,16 @@ class SMU:
         the command acknowledgment) are discarded, so that subsequent commands
         see clean responses. The acknowledgment itself is not validated, since
         it cannot be distinguished from in-flight data packets.
+
+        Raises:
+            SMUException: If data keeps arriving after the stop, e.g. because
+                the other channel is also streaming
         """
+        if self.connection_type == ConnectionType.USB:
+            # The device keeps a partially received command line across host
+            # sessions; an empty line flushes it so STREAM OFF isn't appended
+            # to stray bytes and ignored. Its error reply is drained below.
+            self._write_command("")
         self._write_command(f"SOUR{channel}:DATA:STREAM OFF")
         self._drain_input()
 

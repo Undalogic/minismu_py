@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-10-03
+
+### Fixed
+
+- **Streaming can no longer hang the connection indefinitely**
+  ([#5](https://github.com/Undalogic/minismu_py/issues/5)). The read loops
+  used by `stop_streaming()` and for multi-line/JSON responses (sweep data)
+  only timed out after a quiet gap, so a device that kept streaming blocked
+  them forever. They now have an absolute time limit: `stop_streaming()`
+  raises `SMUException` if data is still arriving after 2 s (typically
+  because the other channel is still streaming - stop it too), and sweep data
+  reads raise after 30 s.
+- **`stop_streaming()` now works on a stream left running by a previous
+  session.** The device keeps a partially received command line across USB
+  sessions, so `STREAM OFF` could be appended to stray bytes and ignored.
+  `stop_streaming()` now sends a blank line first to flush it. Verified on
+  hardware (fw v1.4.6).
+
 ## [0.4.0] - 2026-07-06
 
 ### Fixed
